@@ -1,0 +1,9 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+lxml==5.1.0
+python-multipart==0.0.6
+
+# 🔽 여기 두 줄만 남기고, langchain-core 줄은 완전히 삭제
+openai>=1.24.0,<2.0.0
+langchain-openai>=0.1.7,<0.2.0
