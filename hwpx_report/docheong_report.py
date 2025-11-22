@@ -5,7 +5,7 @@ from copy import deepcopy
 from datetime import datetime
 import re
 
-from hwpx_report.hwp_pydantic import DocheongReport
+from hwpx_report.hwp_pydantic import DocheongReport, DynamicReport
 
 NS = {'hp': 'http://www.hancom.co.kr/hwpml/2011/paragraph'}
 
@@ -300,6 +300,245 @@ def process_docheong_report(json_path: str, xml_template: str, xml_output: str):
 
     # 🔹 향후계획 섹션의 ":" 앞/뒤 공백 정리 (앞 0칸, 뒤 1칸)
     normalize_followup_colon_spacing(root)
+
+    # 저장
+    Path(xml_output).parent.mkdir(parents=True, exist_ok=True)
+    tree.write(
+        str(xml_output),
+        encoding="utf-8",
+        xml_declaration=True,
+        pretty_print=False,
+    )
+
+    print("=" * 60)
+    print(f"✅ 완료: {xml_output}")
+    print("=" * 60 + "\n")
+
+
+def find_content_start_para(root):
+    """
+    본문 시작 위치를 찾음 (첫 번째 □ 섹션 헤더)
+    """
+    paras = get_all_paras(root)
+    for i, p in enumerate(paras):
+        text = get_para_text(p)
+        if text and text.strip().startswith("□"):
+            return i, p
+    return None, None
+
+
+def remove_all_content_sections(root):
+    """
+    모든 □ 섹션과 그 내용을 제거하고, 첫 번째 섹션 헤더의 위치와 템플릿 문단을 반환
+    """
+    paras = get_all_paras(root)
+
+    # 첫 번째 섹션 헤더 찾기
+    start_idx = None
+    first_section_para = None
+    template_para = None
+
+    for i, p in enumerate(paras):
+        text = get_para_text(p)
+        if text and text.strip().startswith("□"):
+            if start_idx is None:
+                start_idx = i
+                first_section_para = p
+                # 템플릿 문단 찾기 (섹션 헤더 바로 다음 문단)
+                if i + 1 < len(paras):
+                    template_para = paras[i + 1]
+            break
+
+    if start_idx is None:
+        print("⚠️ 섹션 헤더를 찾을 수 없음")
+        return None, None, None
+
+    # 첫 번째 섹션 헤더 이후의 모든 문단 제거
+    removed_count = 0
+    for p in list(paras[start_idx:]):
+        try:
+            parent = p.getparent()
+            if parent is not None:
+                parent.remove(p)
+                removed_count += 1
+        except Exception:
+            pass
+
+    print(f"✓ 기존 섹션 제거: {removed_count}개 문단")
+
+    return start_idx, first_section_para, template_para
+
+
+def create_section_header_para(template_para, header_text: str):
+    """
+    섹션 헤더 문단 생성 (□ 로 시작하는 제목)
+    """
+    new_para = deepcopy(template_para)
+
+    # 기존 텍스트 노드 제거
+    for t_node in new_para.xpath(".//hp:t", namespaces=NS):
+        parent = t_node.getparent()
+        if parent is not None:
+            parent.remove(t_node)
+
+    # linesegarray 제거
+    for lsa in new_para.xpath(".//hp:linesegarray", namespaces=NS):
+        parent = lsa.getparent()
+        if parent is not None:
+            parent.remove(lsa)
+
+    # 새 텍스트 추가
+    runs = new_para.xpath(".//hp:run", namespaces=NS)
+    if runs:
+        run = runs[0]
+    else:
+        run = etree.SubElement(new_para, f"{{{NS['hp']}}}run")
+
+    t = etree.SubElement(run, f"{{{NS['hp']}}}t")
+    t.text = header_text
+
+    return new_para
+
+
+def create_content_para(template_para, content_text: str):
+    """
+    내용 문단 생성
+    """
+    new_para = deepcopy(template_para)
+
+    # 기존 텍스트 노드 제거
+    for t_node in new_para.xpath(".//hp:t", namespaces=NS):
+        parent = t_node.getparent()
+        if parent is not None:
+            parent.remove(t_node)
+
+    # linesegarray 제거
+    for lsa in new_para.xpath(".//hp:linesegarray", namespaces=NS):
+        parent = lsa.getparent()
+        if parent is not None:
+            parent.remove(lsa)
+
+    # 새 텍스트 추가
+    runs = new_para.xpath(".//hp:run", namespaces=NS)
+    if runs:
+        run = runs[0]
+    else:
+        run = etree.SubElement(new_para, f"{{{NS['hp']}}}run")
+
+    t = etree.SubElement(run, f"{{{NS['hp']}}}t")
+    t.text = content_text
+
+    return new_para
+
+
+def process_dynamic_report(json_path: str, xml_template: str, xml_output: str):
+    """JSON → XML 변환 (동적 섹션 보고서)"""
+    print("\n" + "=" * 60)
+    print("동적 섹션 보고서 XML 생성")
+    print("=" * 60)
+
+    report = DynamicReport.model_validate_json(
+        Path(json_path).read_text(encoding="utf-8")
+    )
+    print(f"✓ JSON 로드: {Path(json_path).name}")
+    print(f"✓ 섹션 수: {len(report.sections)}개")
+
+    parser = etree.XMLParser(remove_blank_text=False)
+    tree = etree.parse(xml_template, parser)
+    root = tree.getroot()
+    print(f"✓ 템플릿 로드: {Path(xml_template).name}\n")
+
+    # 날짜와 승인 테이블 수정
+    print("📝 헤더 수정 중...")
+    date_updated = update_header_date(root)
+    table_removed = remove_approval_table_by_id(root)
+
+    if not date_updated:
+        print("❌ 날짜 업데이트 실패")
+    if not table_removed:
+        print("❌ 테이블 제거 실패")
+
+    print()
+
+    # 제목 업데이트
+    update_text_only(root, "43", report.title)
+    update_text_only(root, "31", report.title)
+    print(f"✓ 제목: '{report.title}'\n")
+
+    # 기존 모든 섹션 내용 가져오기 (템플릿 문단 확보용)
+    paras = get_all_paras(root)
+
+    # 첫 번째 섹션 헤더와 템플릿 문단 찾기
+    first_section_idx = None
+    first_section_para = None
+    template_para = None
+
+    for i, p in enumerate(paras):
+        text = get_para_text(p)
+        if text and text.strip().startswith("□"):
+            first_section_idx = i
+            first_section_para = p
+            # 템플릿 문단 찾기 (섹션 헤더 다음의 본문 문단)
+            for j in range(i + 1, min(i + 10, len(paras))):
+                candidate = paras[j]
+                cand_text = get_para_text(candidate)
+                if cand_text and not cand_text.strip().startswith("□"):
+                    template_para = candidate
+                    break
+            break
+
+    if first_section_idx is None or template_para is None:
+        print("⚠️ 템플릿 섹션을 찾을 수 없음")
+        return
+
+    # 섹션 헤더용 템플릿도 저장
+    header_template = first_section_para
+
+    # 첫 번째 섹션 헤더 이후 모든 문단 제거
+    removed_count = 0
+    for p in list(paras[first_section_idx:]):
+        try:
+            parent = p.getparent()
+            if parent is not None:
+                parent.remove(p)
+                removed_count += 1
+        except Exception:
+            pass
+
+    print(f"✓ 기존 섹션 제거: {removed_count}개 문단")
+
+    # 삽입 위치 찾기 (제거된 첫 번째 섹션 이전 위치)
+    paras = get_all_paras(root)
+    if paras:
+        insert_after = paras[-1]
+    else:
+        print("⚠️ 삽입 위치를 찾을 수 없음")
+        return
+
+    # 동적 섹션 생성
+    print("\n섹션 생성:")
+    print("-" * 60)
+
+    current_position = insert_after
+    total_added = 0
+
+    for section in report.sections:
+        # 섹션 헤더 생성
+        header_para = create_section_header_para(header_template, section.header)
+        current_position.addnext(header_para)
+        current_position = header_para
+        total_added += 1
+
+        print(f"  ✓ 섹션: '{section.header}' ({len(section.content)}개 항목)")
+
+        # 섹션 내용 생성
+        for line in section.content:
+            content_para = create_content_para(template_para, line)
+            current_position.addnext(content_para)
+            current_position = content_para
+            total_added += 1
+
+    print(f"\n✓ 총 {total_added}개 문단 추가")
 
     # 저장
     Path(xml_output).parent.mkdir(parents=True, exist_ok=True)

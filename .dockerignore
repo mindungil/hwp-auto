@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 temp_outputs/
 도청동향보고서_2*.hwpx
+.env/

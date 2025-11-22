@@ -76,12 +76,23 @@ hwpx_file/
 
 ### 생성 프로세스
 
-1. **입력 데이터 검증**: 사용자 입력을 Pydantic 모델(`DocheongReport`, `JBNUReport`)로 검증
+#### 고정 섹션 모드 (DocheongReport)
+1. **입력 데이터 검증**: Pydantic 모델(`DocheongReport`)로 검증
 2. **템플릿 복사**: `hwpx_report/template/`에서 템플릿 폴더를 임시 위치로 복사
-3. **XML 조작**: `lxml`을 사용해 `section0.xml`의 섹션별 내용 교체
-   - 개요, 테스트현황, 주요이슈, 향후계획 등
+3. **XML 조작**: `lxml`을 사용해 `section0.xml`의 고정 섹션 내용 교체
+   - 개요, 테스트현황, 주요이슈, 향후계획 (4개 섹션 고정)
 4. **이미지 등록**: 그래프를 `BinData/`에 복사하고 `content.hpf` 매니페스트 업데이트
 5. **ZIP 압축**: mimetype은 STORED, 나머지는 DEFLATED로 압축
+
+#### 동적 섹션 모드 (DynamicReport)
+1. **입력 데이터 검증**: Pydantic 모델(`DynamicReport`)로 검증
+2. **템플릿 복사**: 동일
+3. **XML 조작**:
+   - 기존 모든 섹션 제거
+   - LLM이 결정한 섹션 헤더와 내용을 동적 생성
+   - 섹션 수/이름에 제한 없음
+4. **이미지 등록**: 동일
+5. **ZIP 압축**: 동일
 
 ### 핵심 XML 조작
 
@@ -96,8 +107,10 @@ hwpx_file/
 
 | Method | Endpoint | 설명 |
 |--------|----------|------|
-| POST | `/api/report/docheong` | 구조화된 JSON으로 보고서 생성 |
-| POST | `/api/report/docheong-auto` | 원시 텍스트로 자동 분류 후 생성 |
+| POST | `/api/report/docheong` | 고정 섹션 JSON으로 보고서 생성 |
+| POST | `/api/report/docheong-auto` | 원시 텍스트 → 고정 섹션 자동 분류 |
+| POST | `/api/report/dynamic` | 동적 섹션 JSON으로 보고서 생성 |
+| POST | `/api/report/dynamic-auto` | 원시 텍스트 → LLM이 섹션 자유 구성 |
 | GET | `/api/download/{file_id}` | 생성된 HWPX 파일 다운로드 |
 | DELETE | `/api/cleanup/{file_id}` | 임시 파일 정리 |
 
@@ -110,7 +123,7 @@ hwpx_file/
 
 ## 데이터 모델
 
-### DocheongReport (도청동향보고서)
+### DocheongReport (도청동향보고서 - 고정 섹션)
 
 ```python
 class DocheongReport(BaseModel):
@@ -120,6 +133,23 @@ class DocheongReport(BaseModel):
     key_issues: List[str]   # 주요이슈
     followup: List[str]     # 향후계획
 ```
+
+### DynamicReport (동적 섹션 보고서)
+
+```python
+class DynamicSection(BaseModel):
+    header: str          # 섹션 헤더 (예: "□ 사업 개요")
+    content: List[str]   # bullet points
+
+class DynamicReport(BaseModel):
+    title: str
+    sections: List[DynamicSection]  # LLM이 자유롭게 구성
+```
+
+LLM이 입력 내용에 따라 섹션 수와 이름을 동적으로 결정:
+- 내용이 많으면 5-7개 섹션으로 세분화
+- 내용이 간단하면 2-3개 섹션으로 간결하게
+- 섹션 이름은 내용에 맞게 자유롭게 작성
 
 각 리스트는 개조식 형태의 bullet point를 포함:
 - `○ (항목명) 내용`
@@ -166,6 +196,8 @@ app/
 2. **데이터 분석**: Flask 서버가 Qwen3-14B를 사용해 SQL 생성 및 실행
 3. **응답 생성**: LLM이 분석 결과를 자연어로 정리
 4. **보고서 변환**: GPT-4o-mini가 자유 텍스트를 구조화된 JSON으로 변환
+   - **고정 모드**: 4개 섹션(개요/현황/이슈/계획)으로 분류
+   - **동적 모드**: LLM이 내용에 맞는 섹션을 자유롭게 구성
 5. **HWPX 생성**: FastAPI가 템플릿 기반으로 XML 조작 후 HWPX 파일 생성
 6. **다운로드**: 생성된 HWPX 파일을 사용자에게 제공
 

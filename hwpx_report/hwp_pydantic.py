@@ -20,3 +20,14 @@ class DocheongReport(BaseModel):
     test_status: List[str]
     key_issues: List[str]
     followup: List[str]
+
+# 동적 섹션 모델
+class DynamicSection(BaseModel):
+    """동적 섹션 구조"""
+    header: str          # 섹션 헤더 (예: "□ 개요", "□ 분석결과")
+    content: List[str]   # bullet points
+
+class DynamicReport(BaseModel):
+    """동적 섹션 보고서 - LLM이 섹션 구조를 자유롭게 결정"""
+    title: str
+    sections: List[DynamicSection]

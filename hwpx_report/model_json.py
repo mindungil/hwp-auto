@@ -177,3 +177,127 @@ def generate_docheong_json(content: str) -> dict:
 
     except Exception as e:
         raise RuntimeError(f"❌ JSON 파싱 실패: {e}\n응답:\n{response}")
+
+
+def generate_dynamic_json(content: str) -> dict:
+    """
+    자유 형식 회의 내용 → 동적 섹션 JSON 변환
+    LLM이 섹션 수와 이름을 자유롭게 결정
+
+    반환 형식:
+      {
+        "title": "보고서 제목",
+        "sections": [
+          {"header": "□ 섹션명1", "content": ["내용1", "내용2", ...]},
+          {"header": "□ 섹션명2", "content": ["내용1", "내용2", ...]},
+          ...
+        ]
+      }
+    """
+    system_message = """
+당신은 전라북도청의 행정·업무 보고서를 작성하는 전문가이다.
+사용자가 입력한 회의/상황 설명을 읽고, **내용에 맞는 섹션을 자유롭게 구성**하여 JSON 형식으로 정리하라.
+
+중요: 섹션의 수와 이름은 **입력 내용에 따라 동적으로 결정**한다.
+- 내용이 많으면 5-7개 섹션으로 세분화
+- 내용이 간단하면 2-3개 섹션으로 간결하게
+- 섹션 이름은 내용을 가장 잘 반영하는 것으로 자유롭게 작성
+
+반드시 아래 JSON 형식을 사용해야 한다:
+
+{
+  "title": "보고서 제목(짧게 요약)",
+  "sections": [
+    {
+      "header": "□ 섹션명",
+      "content": [
+        "○ (항목명) 한 줄 요약 문장",
+        "    - 필요하면 세부 설명 한 줄",
+        "    ※ 비고가 있으면 이렇게 한 줄"
+      ]
+    }
+  ]
+}
+
+[섹션 이름 예시 - 상황에 맞게 자유롭게]
+- 서비스/프로젝트: "□ 사업 개요", "□ 추진 현황", "□ 주요 성과", "□ 문제점 및 개선사항", "□ 향후 계획"
+- 회의 보고: "□ 회의 개요", "□ 논의 사항", "□ 결정 사항", "□ 후속 조치"
+- 분석 보고: "□ 분석 배경", "□ 데이터 현황", "□ 분석 결과", "□ 시사점", "□ 제언"
+- 일반 보고: "□ 배경", "□ 현황", "□ 문제점", "□ 대응방안", "□ 기대효과"
+
+[문체·형식 규칙 — 개조식·보고서 스타일]
+1. 모든 문장은 **개조식 문체**로 작성할 것.
+   - 문장 끝은 가급적 "~함", "~임", "~필요", "~계획임" 등 **체언+이다 / 명사형**으로 마무리.
+   - 예: "스트레스 해소 수단으로 활용 중임", "시간 관리 보완 필요", "추가 예산 검토 계획임".
+2. **문장 끝에 마침표( . )를 붙이지 말 것.**
+3. "~합니다", "~했습니다" 등의 서술식 종결어미는 사용하지 말 것.
+4. 각 항목은 한 줄짜리 문장으로 간결하게 작성할 것.
+5. 주관적·감상적 표현은 피하고, **사실·관찰·계획 중심**으로 정리할 것.
+
+[형식 규칙 — JSON 구조]
+1. 각 섹션의 header는 반드시 "□ "로 시작해야 한다.
+2. 각 content 항목은 "○ "로 시작하고, 세부사항은 "    - ", 비고는 "    ※ "로 시작한다.
+3. 섹션에 넣을 내용이 없으면 해당 섹션을 생성하지 않는다.
+4. 각 문자열은 한 줄짜리 문장으로 작성하고, 줄바꿈 문자("\\n")는 포함하지 않는다.
+5. JSON 전체만 반환하고, 설명 텍스트는 포함하지 않는다.
+"""
+
+    prompt = f"""다음 회의/상황 설명을 읽고 내용에 맞는 섹션을 자유롭게 구성하여 JSON을 생성하세요.
+
+입력 텍스트:
+\"\"\"{content}\"\"\""""
+
+    print("🤖 OpenAI GPT로 동적 섹션 JSON 생성 중...")
+    response = generate_response(prompt, system_message)
+
+    print("\n=== LLM 응답 ===")
+    print(response)
+    print("=" * 60 + "\n")
+
+    try:
+        json_str = extract_json_block(response)
+        raw = json.loads(json_str)
+
+        # 필수 필드 검증
+        cleaned = {
+            "title": raw.get("title", "무제 보고서"),
+            "sections": []
+        }
+
+        # sections 처리
+        sections = raw.get("sections", [])
+        if not isinstance(sections, list):
+            sections = []
+
+        for section in sections:
+            if isinstance(section, dict):
+                header = section.get("header", "□ 기타")
+                content = section.get("content", [])
+
+                # content가 list[str]인지 확인
+                if isinstance(content, str):
+                    content = [content]
+                elif isinstance(content, list):
+                    content = [str(v) for v in content]
+                else:
+                    content = [str(content)]
+
+                # 마침표 제거
+                content = [re.sub(r"[.]+$", "", v.rstrip()).rstrip() for v in content]
+
+                cleaned["sections"].append({
+                    "header": header,
+                    "content": content
+                })
+
+        # 섹션이 하나도 없으면 기본 섹션 추가
+        if not cleaned["sections"]:
+            cleaned["sections"] = [{
+                "header": "□ 내용",
+                "content": ["○ (내용) 입력된 내용이 없음"]
+            }]
+
+        return cleaned
+
+    except Exception as e:
+        raise RuntimeError(f"❌ JSON 파싱 실패: {e}\n응답:\n{response}")

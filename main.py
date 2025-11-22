@@ -7,16 +7,17 @@ import shutil
 import uuid
 import json  # ✅ pydantic 대신 직접 JSON 직렬화용
 
-from hwpx_report.hwp_pydantic import DocheongReport
-from hwpx_report.docheong_report import process_docheong_report
+from hwpx_report.hwp_pydantic import DocheongReport, DynamicReport, DynamicSection
+from hwpx_report.docheong_report import process_docheong_report, process_dynamic_report
 from hwpx_report.hwpx_compress import create_hwpx_from_folder
 
 # 🔹 LLM 자동 분류 헬퍼 (없어도 서버는 뜨도록 try/except)
 try:
     # 줄글(STT 결과) → 섹션 JSON 자동 분류 함수
-    from hwpx_report.model_json import generate_docheong_json
+    from hwpx_report.model_json import generate_docheong_json, generate_dynamic_json
 except ImportError:
     generate_docheong_json = None
+    generate_dynamic_json = None
 
 app = FastAPI(title="HWPX Report API", version="1.0.0")
 
@@ -46,6 +47,27 @@ class DocheongAutoRequest(BaseModel):
     """
     text: str                 # 전체 줄글 / STT 텍스트
     title: str | None = None  # 제목을 직접 지정하고 싶으면 사용 (없으면 LLM이 정한 제목 사용)
+
+
+class DynamicSectionRequest(BaseModel):
+    """동적 섹션 요청"""
+    header: str
+    content: list[str]
+
+
+class DynamicReportRequest(BaseModel):
+    """동적 섹션 보고서 요청 - 섹션 구조가 자유로움"""
+    title: str
+    sections: list[DynamicSectionRequest]
+
+
+class DynamicAutoRequest(BaseModel):
+    """
+    줄글 / STT 결과 그대로 받아서
+    LLM이 섹션 수/이름을 자유롭게 결정하도록 하는 요청 타입
+    """
+    text: str
+    title: str | None = None
 
 
 class ReportResponse(BaseModel):
@@ -119,6 +141,42 @@ def _create_docheong_hwpx(report: DocheongReport) -> tuple[str, Path]:
     return file_id, hwpx_output
 
 
+def _create_dynamic_hwpx(report: DynamicReport) -> tuple[str, Path]:
+    """
+    동적 섹션 HWPX 생성 로직.
+      1) JSON 저장
+      2) 템플릿 폴더 복사
+      3) XML(section0.xml) 내용 갱신
+      4) 폴더 전체를 .hwpx로 압축
+
+    반환:
+      (file_id, hwpx_output_path)
+    """
+    file_id = f"dynamic_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+    # 1) JSON 저장
+    json_path = TEMP_DIR / f"{file_id}.json"
+    data = report.model_dump()
+    json_text = json.dumps(data, ensure_ascii=False, indent=2)
+    json_path.write_text(json_text, encoding="utf-8")
+
+    # 2) 템플릿 복사
+    template_src = _get_template_dir()
+    work_dir = TEMP_DIR / file_id
+    shutil.copytree(template_src, work_dir)
+
+    # 3) XML 변환 (동적 섹션 처리)
+    xml_template = work_dir / "Contents/section0.xml"
+    xml_output = work_dir / "Contents/section0.xml"
+    process_dynamic_report(str(json_path), str(xml_template), str(xml_output))
+
+    # 4) HWPX 압축 생성
+    hwpx_output = TEMP_DIR / f"{file_id}.hwpx"
+    create_hwpx_from_folder(str(work_dir), str(hwpx_output))
+
+    return file_id, hwpx_output
+
+
 # ---------- 엔드포인트 ----------
 
 @app.get("/")
@@ -128,8 +186,11 @@ async def root():
         "status": "running",
         "port": 5001,
         "endpoints": {
+            "generate": "POST /api/report/generate (원스텝: 텍스트→파일)",
             "docheong": "POST /api/report/docheong",
             "docheong_auto": "POST /api/report/docheong-auto",
+            "dynamic": "POST /api/report/dynamic",
+            "dynamic_auto": "POST /api/report/dynamic-auto",
             "download": "GET /api/download/{file_id}",
             "cleanup": "DELETE /api/cleanup/{file_id}",
         },
@@ -194,6 +255,111 @@ async def create_docheong_report_auto(request: DocheongAutoRequest):
             message="도청 보고서(자동 분류) 생성 완료",
             file_id=file_id,
             download_url=f"/api/download/{file_id}",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/report/dynamic", response_model=ReportResponse)
+async def create_dynamic_report(request: DynamicReportRequest):
+    """
+    동적 섹션 보고서 생성 - 섹션 수/이름이 자유로움.
+    - title: 보고서 제목
+    - sections: [{header: "□ 섹션명", content: ["내용1", "내용2", ...]}, ...]
+    """
+    try:
+        # DynamicReport로 변환
+        sections = [
+            DynamicSection(header=s.header, content=s.content)
+            for s in request.sections
+        ]
+        report = DynamicReport(title=request.title, sections=sections)
+
+        # HWPX 생성
+        file_id, _ = _create_dynamic_hwpx(report)
+
+        return ReportResponse(
+            success=True,
+            message="동적 섹션 보고서 생성 완료",
+            file_id=file_id,
+            download_url=f"/api/download/{file_id}",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/report/dynamic-auto", response_model=ReportResponse)
+async def create_dynamic_report_auto(request: DynamicAutoRequest):
+    """
+    줄글 / STT 결과(text)만 받아서:
+      1) LLM이 섹션 수/이름을 자유롭게 결정
+      2) DynamicReport로 검증
+      3) HWPX 생성
+    """
+    if generate_dynamic_json is None:
+        raise HTTPException(
+            status_code=500,
+            detail="동적 섹션 자동 분류 기능이 비활성화되어 있습니다. "
+                   "서버에 langchain_openai 및 관련 의존성을 설치해야 합니다."
+        )
+
+    try:
+        # 1) 줄글 → JSON (LLM이 섹션 자유롭게 결정)
+        report_json = generate_dynamic_json(request.text)
+
+        # 2) 제목이 별도로 들어오면 덮어쓰기
+        if request.title:
+            report_json["title"] = request.title
+
+        # 3) pydantic 검증
+        report = DynamicReport(**report_json)
+
+        # 4) HWPX 생성
+        file_id, _ = _create_dynamic_hwpx(report)
+
+        return ReportResponse(
+            success=True,
+            message="동적 섹션 보고서(자동 분류) 생성 완료",
+            file_id=file_id,
+            download_url=f"/api/download/{file_id}",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/report/generate")
+async def generate_report_direct(request: DynamicAutoRequest):
+    """
+    원스텝 파이프라인: 텍스트 → LLM 섹션 구성 → HWPX 생성 → 파일 직접 반환
+    """
+    if generate_dynamic_json is None:
+        raise HTTPException(
+            status_code=500,
+            detail="동적 섹션 자동 분류 기능이 비활성화되어 있습니다."
+        )
+
+    try:
+        # 1) 줄글 → JSON (LLM이 섹션 자유롭게 결정)
+        report_json = generate_dynamic_json(request.text)
+
+        # 2) 제목이 별도로 들어오면 덮어쓰기
+        if request.title:
+            report_json["title"] = request.title
+
+        # 3) pydantic 검증
+        report = DynamicReport(**report_json)
+
+        # 4) HWPX 생성
+        file_id, hwpx_path = _create_dynamic_hwpx(report)
+
+        # 5) 파일명 생성 (제목 기반)
+        safe_title = report.title.replace(" ", "_").replace("/", "_")[:50]
+        filename = f"{safe_title}_{file_id}.hwpx"
+
+        return FileResponse(
+            path=hwpx_path,
+            media_type="application/vnd.hancom.hwpx",
+            filename=filename,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
